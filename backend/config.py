@@ -47,6 +47,8 @@ class Config:
     LOGIN_MAX_FAILURES = int(os.environ.get("LOGIN_MAX_FAILURES", "5"))
     LOGIN_WINDOW_SECONDS = int(os.environ.get("LOGIN_WINDOW_SECONDS", "900"))
     MAX_CONTENT_LENGTH = 64 * 1024
+    RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")   # email features answer 503 until both are set
+    EMAIL_FROM = os.environ.get("EMAIL_FROM", "")           # e.g. HealthGuard Lite <no-reply@yourdomain.com>
 
 
 def validate_config(cfg) -> None:

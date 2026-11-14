@@ -15,6 +15,7 @@ class User(db.Model, Timestamps):
     updated_at = db.Column(db.DateTime(timezone=True), default=now, onupdate=now, nullable=False)
     # Bumped on logout: invalidates every JWT issued before (server-side revocation for stateless tokens).
     token_version = db.Column(db.Integer, nullable=False, default=0, server_default="0")
+    email_verified = db.Column(db.Boolean, nullable=False, default=False)
     profile = db.relationship("UserProfile", uselist=False, backref="user", cascade="all, delete-orphan")
 
 class UserProfile(db.Model, Timestamps):
@@ -69,3 +70,16 @@ class EmergencyEvent(db.Model, Timestamps):
     longitude = db.Column(db.Float)
     event_status = db.Column(db.String(30), nullable=False, default="activated")
     __table_args__ = (db.Index("ix_event_user_time", "user_id", "created_at"),)
+
+
+class EmailOtp(db.Model):
+    """One live code per (user, purpose); issuing a new code replaces the old one. Only an HMAC of the code is stored."""
+    __tablename__ = "email_otps"
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    purpose = db.Column(db.String(10), nullable=False)   # "verify" | "reset"
+    code_hash = db.Column(db.String(64), nullable=False)
+    expires_at = db.Column(db.DateTime(timezone=True), nullable=False)
+    attempts = db.Column(db.Integer, nullable=False, default=0)
+    created_at = db.Column(db.DateTime(timezone=True), default=now, nullable=False)
+    __table_args__ = (db.UniqueConstraint("user_id", "purpose", name="uq_email_otp_user_purpose"),)

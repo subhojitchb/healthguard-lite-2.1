@@ -26,6 +26,3 @@ nav a.on{background:#dff5f3;color:var(--teal)}
 .skel{height:80px;border-radius:16px;background:linear-gradient(90deg,#e3f3f1 25%,#f3fbfa 50%,#e3f3f1 75%);background-size:200% 100%;animation:sh 1.2s infinite}@keyframes sh{to{background-position:-200% 0}}
 .pulse{animation:beat 1s infinite;display:inline-block}.pill{padding:3px 10px;border-radius:99px;font-size:.75rem;background:#dff5f3;color:var(--teal)}
 @media(prefers-reduced-motion:reduce){*{animation:none!important}}
-[hidden] {
-  display: none !important;
-}

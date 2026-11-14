@@ -69,16 +69,75 @@ function viewAuth(app) {
     <label>Password (min 8)</label><input name="password" type="password" required minlength="8" autocomplete="${mode === "login" ? "current-password" : "new-password"}">
     <button style="width:100%;margin-top:8px">${mode === "login" ? "Log in" : "Register"}</button></form>
     <p class="mut" style="text-align:center"><a href="#" id="sw">${mode === "login" ? "New here? Register" : "Have an account? Log in"}</a></p>
-    <p class="mut">Password reset is not available in this version.</p></div>`;
+    ${mode === "login" ? '<p class="mut" style="text-align:center"><a href="#" id="fp">Forgot password?</a></p>' : ""}</div>`;
     $("#sw").onclick = e => { e.preventDefault(); mode = mode === "login" ? "register" : "login"; draw(); };
+    if (mode === "login") $("#fp").onclick = e => { e.preventDefault(); showForgot(app); };
     $("#f").onsubmit = async e => {
       e.preventDefault(); const b = e.target.querySelector("button"); b.disabled = true;
       try {
         const d = await api("/auth/" + mode, "POST", Object.fromEntries(new FormData(e.target)));
+        if (d.verification_required) return showVerify(app, d.user.email, d.email_sent, d.email_sent ? d.resend_in : 0);
         localStorage.setItem(TOKEN_KEY, d.token); S.user = d.user; await render(); checkInterrupted(); flushOutbox();
-      } catch (er) { toast(er.message); b.disabled = false; }
+      } catch (er) {
+        if (er.status === 403 && /not verified/i.test(er.message)) return showVerify(app, e.target.email.value.trim().toLowerCase(), false, 0);
+        toast(er.message); b.disabled = false;
+      }
     };
   }; draw();
+}
+
+// ---------- email verification & password reset (codes are only ever held in the input fields, never stored) ----------
+function otpCountdown(btn, secs, label) {
+  clearInterval(S.otpTimer); let n = secs;
+  const tick = () => { if (!btn.isConnected) return clearInterval(S.otpTimer); btn.disabled = n > 0; btn.textContent = n > 0 ? `${label} (${n}s)` : label; n--; };
+  tick(); S.otpTimer = setInterval(tick, 1000);
+}
+function showVerify(app, email, sent = true, wait = 60) {
+  app.innerHTML = `<div class="card" style="margin-top:12vh"><h2>Verify your email</h2>
+  <p class="mut">${sent ? "We sent a 6-digit code to" : "Enter the code we emailed to, or request a new one for"} <b>${esc(email)}</b>. Codes expire after 10 minutes.</p>
+  <form id="vf"><label>Verification code</label><input name="code" required inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code">
+  <button style="width:100%;margin-top:8px">Verify</button></form>
+  <p style="text-align:center"><button class="sec" id="rs" type="button">Resend code</button></p>
+  <p class="mut" style="text-align:center"><a href="#" id="bk">Back to login</a></p></div>`;
+  otpCountdown($("#rs"), wait, "Resend code");
+  if (!sent) toast("We couldn't email a code yet — tap Resend code.");
+  $("#bk").onclick = e => { e.preventDefault(); clearInterval(S.otpTimer); viewAuth(app); };
+  $("#rs").onclick = async () => { try { const d = await api("/auth/resend-verification", "POST", { email }); toast(d.message); otpCountdown($("#rs"), d.resend_in, "Resend code"); } catch (er) { toast(er.message); } };
+  $("#vf").onsubmit = async e => {
+    e.preventDefault(); const b = e.target.querySelector("button"); b.disabled = true;
+    try {
+      const d = await api("/auth/verify-email", "POST", { email, code: e.target.code.value.trim() });
+      clearInterval(S.otpTimer); localStorage.setItem(TOKEN_KEY, d.token); S.user = d.user; await render(); checkInterrupted(); flushOutbox();
+    } catch (er) { toast(er.message); b.disabled = false; }
+  };
+}
+function showForgot(app) {
+  app.innerHTML = `<div class="card" style="margin-top:12vh"><h2>Reset password</h2><p class="mut">Enter your account email and we'll send a 6-digit code.</p>
+  <form id="ff"><label>Email</label><input name="email" type="email" required autocomplete="email"><button style="width:100%;margin-top:8px">Send code</button></form>
+  <p class="mut" style="text-align:center"><a href="#" id="bk">Back to login</a></p></div>`;
+  $("#bk").onclick = e => { e.preventDefault(); viewAuth(app); };
+  $("#ff").onsubmit = async e => {
+    e.preventDefault(); const b = e.target.querySelector("button"); b.disabled = true; const email = e.target.email.value.trim().toLowerCase();
+    try { const d = await api("/auth/forgot-password", "POST", { email }); toast(d.message); showReset(app, email, d.resend_in); }
+    catch (er) { toast(er.message); b.disabled = false; }
+  };
+}
+function showReset(app, email, wait = 60) {
+  app.innerHTML = `<div class="card" style="margin-top:12vh"><h2>Choose a new password</h2>
+  <p class="mut">If <b>${esc(email)}</b> is registered, a 6-digit code was sent. It expires in 10 minutes.</p>
+  <form id="rf"><label>Reset code</label><input name="code" required inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code">
+  <label>New password (min 8)</label><input name="pw" type="password" required minlength="8" autocomplete="new-password">
+  <button style="width:100%;margin-top:8px">Reset password</button></form>
+  <p style="text-align:center"><button class="sec" id="rs" type="button">Send a new code</button></p>
+  <p class="mut" style="text-align:center"><a href="#" id="bk">Back to login</a></p></div>`;
+  otpCountdown($("#rs"), wait, "Send a new code");
+  $("#bk").onclick = e => { e.preventDefault(); clearInterval(S.otpTimer); viewAuth(app); };
+  $("#rs").onclick = async () => { try { const d = await api("/auth/forgot-password", "POST", { email }); toast(d.message); otpCountdown($("#rs"), d.resend_in, "Send a new code"); } catch (er) { toast(er.message); } };
+  $("#rf").onsubmit = async e => {
+    e.preventDefault(); const b = e.target.querySelector("button"); b.disabled = true;
+    try { await api("/auth/reset-password", "POST", { email, code: e.target.code.value.trim(), new_password: e.target.pw.value }); clearInterval(S.otpTimer); toast("Password updated. Please log in."); viewAuth(app); }
+    catch (er) { toast(er.message); b.disabled = false; }
+  };
 }
 async function logout() {
   S.abortHR?.(); try { await stopSteps(false); } catch {}

@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from . import db
+from . import email_service as mail
 from .errors import ApiError
 from .models import (User, UserProfile, HealthRecord, ActivityRecord,
                      EmergencyContact, EmergencyEvent)
@@ -131,6 +132,8 @@ def auth(fn):
                 raise ValueError("revoked")
         except Exception:
             raise ApiError("Invalid or expired token", 401)
+        if not user.email_verified:
+            raise ApiError("Email not verified", 403)
         g.user = user
         return fn(*a, **k)
     return wrapper
@@ -179,16 +182,28 @@ def register():
         raise ApiError("A valid email is required")
     if not isinstance(pw, str) or not 8 <= len(pw) <= 128:
         raise ApiError("Password must be 8-128 characters")
-    if User.query.filter_by(email=email).first():
+    mail.require_configured()
+    mail.limit_request()
+    u = User.query.filter_by(email=email).first()
+    if u and u.email_verified:
         raise ApiError("Email already registered", 409)
-    u = User(full_name=name, email=email, password_hash=generate_password_hash(pw))
-    u.profile = UserProfile()
-    db.session.add(u)
+    if u:
+        # Abandoned unverified signup. While its code is still live nobody may overwrite it
+        # (prevents hijacking someone's pending registration); afterwards a new signup takes over.
+        if mail.active_otp(u, "verify"):
+            raise ApiError("A verification code was already sent to this address. Check your inbox, or try again in 10 minutes.", 409)
+        u.full_name, u.password_hash = name, generate_password_hash(pw)
+    else:
+        u = User(full_name=name, email=email, password_hash=generate_password_hash(pw), email_verified=False)
+        u.profile = UserProfile()
+        db.session.add(u)
     try:
         commit()
     except IntegrityError:  # concurrent duplicate registration
         raise ApiError("Email already registered", 409)
-    return ok({"token": make_token(u), "user": user_json(u)}, 201)
+    sent = mail.send_otp(u, "verify")
+    return ok({"user": user_json(u), "verification_required": True, "email_sent": sent,
+               "resend_in": mail.RESEND_COOLDOWN}, 201)
 
 
 @bp.post("/auth/login")
@@ -207,6 +222,8 @@ def login():
             _fails.setdefault(key, []).append(time.time())
         raise ApiError("Invalid email or password", 401)
     _fails.pop(keys[0][0], None)
+    if not u.email_verified:
+        raise ApiError("Email not verified. Enter the code we emailed you.", 403)
     return ok({"token": make_token(u), "user": user_json(u)})
 
 
@@ -224,6 +241,73 @@ def logout():
 @auth
 def me():
     return ok(user_json(g.user))
+
+
+# ---------------------------------------------------------------- email verification & password reset
+def _email_arg(d):
+    email = clean(d.get("email"), 254).lower()
+    if not EMAIL_RE.match(email):
+        raise ApiError("A valid email is required")
+    return email
+
+
+def _code_arg(d):
+    code = d.get("code")
+    if not isinstance(code, str) or not re.fullmatch(r"\d{6}", code.strip()):
+        raise ApiError("Enter the 6-digit code")
+    return code.strip()
+
+
+@bp.post("/auth/verify-email")
+def verify_email():
+    d = body()
+    email, code = _email_arg(d), _code_arg(d)
+    mail.limit_request()
+    u = User.query.filter_by(email=email).first()
+    mail.check_otp(u, "verify", code)
+    u.email_verified = True
+    commit()
+    return ok({"token": make_token(u), "user": user_json(u)})
+
+
+@bp.post("/auth/resend-verification")
+def resend_verification():
+    email = _email_arg(body())
+    mail.require_configured()
+    mail.limit_request(email)
+    u = User.query.filter_by(email=email).first()
+    if u and not u.email_verified:
+        mail.send_otp(u, "verify")
+    # Identical answer whether or not the address exists / is pending.
+    return ok({"message": "If this email is awaiting verification, a new code has been sent.", "resend_in": mail.RESEND_COOLDOWN})
+
+
+@bp.post("/auth/forgot-password")
+def forgot_password():
+    email = _email_arg(body())
+    mail.require_configured()
+    mail.limit_request(email)
+    u = User.query.filter_by(email=email).first()
+    if u:
+        mail.send_otp(u, "reset")
+    return ok({"message": "If this email is registered, a reset code has been sent.", "resend_in": mail.RESEND_COOLDOWN})
+
+
+@bp.post("/auth/reset-password")
+def reset_password():
+    d = body()
+    email, code, pw = _email_arg(d), _code_arg(d), d.get("new_password")
+    if not isinstance(pw, str) or not 8 <= len(pw) <= 128:
+        raise ApiError("Password must be 8-128 characters")
+    mail.limit_request()
+    u = User.query.filter_by(email=email).first()
+    mail.check_otp(u, "reset", code)
+    u.password_hash = generate_password_hash(pw)
+    u.token_version += 1          # every existing session/token becomes invalid
+    u.email_verified = True       # the code proved control of the mailbox
+    mail.EmailOtp.query.filter_by(user_id=u.id).delete()
+    commit()
+    return ok({"message": "Password updated. Please log in."})
 
 
 # ---------------------------------------------------------------- profile

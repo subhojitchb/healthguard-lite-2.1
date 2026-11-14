@@ -4,7 +4,32 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app import create_app, db
-from app import routes
+from app import routes, email_service
+
+OUTBOX = []   # captured emails (test double for the Resend sender; real delivery is tested separately)
+
+
+def fake_sender(to, subject, html, text):
+    OUTBOX.append({"to": to, "subject": subject, "html": html, "text": text})
+
+
+def last_code(email):
+    import re
+    mails = [m for m in OUTBOX if m["to"] == email]
+    return re.search(r"\b(\d{6})\b", mails[-1]["text"]).group(1)
+from app import email_service
+
+OUTBOX = []   # emails captured by the test sender (the real Resend client is tested separately against a local HTTP server)
+
+
+def capture_email(to, subject, html, text):
+    OUTBOX.append({"to": to, "subject": subject, "html": html, "text": text})
+
+
+def last_code(email):
+    import re
+    msgs = [m for m in OUTBOX if m["to"] == email]
+    return re.search(r"\b(\d{6})\b", msgs[-1]["text"]).group(1)
 
 
 class TestConfig:
@@ -17,11 +42,21 @@ class TestConfig:
     TRUST_PROXY = False
     LOGIN_MAX_FAILURES = 5
     LOGIN_WINDOW_SECONDS = 900
+    EMAIL_SENDER = staticmethod(fake_sender)
+    RESEND_API_KEY = ""
+    EMAIL_FROM = ""
+    EMAIL_SENDER = staticmethod(capture_email)
+    RESEND_API_KEY = ""
+    EMAIL_FROM = ""
 
 
 @pytest.fixture()
 def app():
     routes._fails.clear()
+    email_service._hits.clear()
+    OUTBOX.clear()
+    email_service._hits.clear()
+    OUTBOX.clear()
     a = create_app(TestConfig)
     with a.app_context():
         db.drop_all()
@@ -37,9 +72,13 @@ def client(app):
 
 
 def register(client, n=1, password="password123"):
-    r = client.post("/api/auth/register", json={"full_name": f"User {n}", "email": f"user{n}@example.com", "password": password})
+    """Register AND verify (email OTP) so the account can use the app."""
+    email = f"user{n}@example.com"
+    r = client.post("/api/auth/register", json={"full_name": f"User {n}", "email": email, "password": password})
     assert r.status_code == 201, r.get_json()
-    d = r.get_json()["data"]
+    v = client.post("/api/auth/verify-email", json={"email": email, "code": last_code(email)})
+    assert v.status_code == 200, v.get_json()
+    d = v.get_json()["data"]
     return {"Authorization": "Bearer " + d["token"]}, d["user"]
 
 

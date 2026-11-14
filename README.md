@@ -12,9 +12,9 @@ Camera/torch/motion need HTTPS (or localhost) and a real phone. For phone testin
 
 ## Tests
 ```bash
-cd backend && pytest -q                      # 61 tests, SQLite in memory
+cd backend && pytest -q                      # 90 tests, SQLite in memory
 TEST_DATABASE_URL=postgresql://... pytest -q # same suite on PostgreSQL (use a throwaway DB: tables are dropped!)
-cd ../frontend && node tests/signal.test.js && node tests/boot.test.js   # algorithm + config-guard tests (synthetic signals)
+cd ../frontend && node tests/signal.test.js && node tests/boot.test.js && node tests/auth-screens.test.js   # algorithm + config-guard tests (synthetic signals)
 ```
 
 ## Deploy (order matters: Neon → Render → Vercel → back to Render)
@@ -25,11 +25,11 @@ cd ../frontend && node tests/signal.test.js && node tests/boot.test.js   # algor
 5. Walk through `docs/DEPLOYMENT_CHECKLIST.md`.
 
 ## API (JSON `{ok, data | error}`; private routes need `Authorization: Bearer <jwt>`)
-Auth `POST /api/auth/register|login|logout`, `GET /api/auth/me` · Profile `GET|PUT /api/profile` · Health `POST|GET /api/health/records[?date=YYYY-MM-DD&tz=Zone&limit&offset]`, `GET /api/health/latest` · Activity `POST|GET /api/activity` (optional `client_id` UUID → idempotent), `GET /api/activity/daily?days=&tz=Asia/Kolkata` · Emergency `GET|POST /api/emergency/contacts`, `PUT|DELETE /api/emergency/contacts/<id>`, `POST /api/emergency/sos`, `GET /api/emergency/events` · `GET /api/health-check`.
+Auth `POST /api/auth/register|login|logout|verify-email|resend-verification|forgot-password|reset-password`, `GET /api/auth/me` · Profile `GET|PUT /api/profile` · Health `POST|GET /api/health/records[?date=YYYY-MM-DD&tz=Zone&limit&offset]`, `GET /api/health/latest` · Activity `POST|GET /api/activity` (optional `client_id` UUID → idempotent), `GET /api/activity/daily?days=&tz=Asia/Kolkata` · Emergency `GET|POST /api/emergency/contacts`, `PUT|DELETE /api/emergency/contacts/<id>`, `POST /api/emergency/sos`, `GET /api/emergency/events` · `GET /api/health-check`.
 
 ## Security notes
 - **JWT**: HS256, claims `sub, iss, iat, exp, jti, tv`; expiry 24 h (`JWT_EXPIRY_HOURS`, max 168); algorithm pinned, `exp/iat/sub/iss` required.
-- **Logout is server-side**: it bumps the user's `token_version`, which invalidates *every* token issued before it (all devices). Remaining limits: no refresh tokens (re-login after 24 h); a token stays valid until logout/expiry if the logout request can't reach the server; there is no password-change/reset flow yet (a reset would also bump `token_version`).
+- **Logout is server-side**: it bumps the user's `token_version`, which invalidates *every* token issued before it (all devices). Remaining limits: no refresh tokens (re-login after 24 h); a token stays valid until logout/expiry if the logout request can't reach the server; a password reset bumps `token_version`, so it also signs out every device.
 - **Cookies vs bearer token (decision)**: HttpOnly cookies were *not* adopted. Vercel and Render are different sites, so the cookie would be third-party (`SameSite=None`) and is blocked or partitioned by Safari/iOS and increasingly by Chrome; it would also need CSRF protection. The token lives in `localStorage`, so an XSS bug could steal it; mitigations: all dynamic HTML is escaped, no third-party scripts except Chart.js from cdnjs, security headers, 24 h expiry, server-side revocation. If you later want cookies, the robust route is a Vercel rewrite proxying `/api/*` to Render (same-site) + `HttpOnly; Secure; SameSite=Lax` cookie + CSRF token.
 - Login throttle (5 failures / 15 min per email, 25 per IP) is **in memory per worker** – it slows brute force but is not shared across workers/restarts.
 - API responses are `Cache-Control: no-store`; the service worker never touches cross-origin/API requests.
@@ -41,4 +41,19 @@ Auth `POST /api/auth/register|login|logout`, `GET /api/auth/me` · Profile `GET|
 - Camera readings need `signal_quality ≥ 0.6` (enforced client **and** server); SpO₂ is only accepted from an external sensor.
 
 ## Known limitations
-Password reset not implemented · profile picture upload not built · SpO₂ UI shows "unavailable" · SOS records the event and offers call/share; it sends no SMS · offline: only the 112 call link works · see `docs/CHANGE_REPORT.md` for exactly what was and wasn't verified.
+profile picture upload not built · SpO₂ UI shows "unavailable" · SOS records the event and offers call/share; it sends no SMS · offline: only the 112 call link works · see `docs/CHANGE_REPORT.md` for exactly what was and wasn't verified.
+
+## Email verification & password reset (Resend)
+**Flow.** Register → account created *unverified* (no token issued) → 6-digit code emailed → `POST /api/auth/verify-email` marks it verified and returns the usual `{token, user}`. Unverified accounts get `403` from login and from every protected endpoint. "Forgot password?" → `forgot-password` → code → `reset-password` (new password, all existing tokens revoked). Codes: 10-minute expiry, single use, 5 wrong attempts per code, 60-second resend cooldown, a new code invalidates the previous one, only an HMAC (keyed with `SECRET_KEY`) is stored, never logged or returned. `forgot-password` / `resend-verification` answer identically whether or not the address exists. Request limits (5/hour per email, 30/hour per IP) are in memory per worker. A pending, unverified signup cannot be overwritten while its code is live (stops someone pre-registering your email with their password); after 10 minutes a new signup replaces it. A successful reset also marks the email verified.
+
+**Existing users stay verified**: the migration (`b2d4f6a8c0e1`) marks every row that exists at upgrade time as verified and creates `email_otps`. Nothing is dropped or rewritten.
+
+**Resend setup (required, or no email can reach real users)**
+1. Create an account at resend.com → **Domains → Add Domain** (a domain you own; a subdomain like `mail.yourdomain.com` is fine).
+2. Add the DNS records Resend shows (SPF `TXT`, DKIM, and the MX/`TXT` for the return path) at your DNS provider; wait until the domain shows **Verified**.
+3. **API Keys → Create API Key** with *Sending access* limited to that domain; copy it once.
+4. Render → Environment: `RESEND_API_KEY=<key>` and `EMAIL_FROM=HealthGuard Lite <no-reply@yourdomain.com>` (address must be on the verified domain). No Vercel variable is needed.
+5. Without a verified domain Resend only lets you test with `onboarding@resend.dev` **to your own account email**; every other recipient is rejected, and the API logs the reason (`Resend rejected the email (HTTP 403): ...`) while the app tells the user to use *Resend code*.
+If the two variables are missing the API still starts and existing users can log in, but register / forgot-password / resend answer `503 Email service is not configured`.
+
+**Deploy order.** (1) Back up / branch the Neon database. (2) Set the two env vars on Render. (3) Deploy backend: the build runs `flask db upgrade` (adds `users.email_verified`, `email_otps`; or run it manually: `cd backend && flask --app run db upgrade`). (4) Deploy the frontend (Vercel, no new variables). (5) Test: register with a real mailbox, check the email, verify, log out/in, then try Forgot password.

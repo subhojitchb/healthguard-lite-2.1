@@ -14,3 +14,5 @@ services:
       - {key: SECRET_KEY, generateValue: true}   # 32+ chars; Render generates a random value
       - {key: DATABASE_URL, sync: false}         # Neon connection string (set in dashboard)
       - {key: CORS_ORIGINS, sync: false}         # e.g. https://your-app.vercel.app (comma-separated, no trailing slash)
+      - {key: RESEND_API_KEY, sync: false}       # Resend API key (sending access)
+      - {key: EMAIL_FROM, sync: false}           # e.g. HealthGuard Lite <no-reply@your-domain.com>

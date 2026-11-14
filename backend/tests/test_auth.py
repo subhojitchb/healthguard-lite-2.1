@@ -100,7 +100,8 @@ def test_logout_revokes_all_tokens(client):
     assert client.get("/api/auth/me", headers=new).status_code == 200
 
 
-PUBLIC = {"api.register", "api.login", "api.health_check", "static"}
+PUBLIC = {"api.register", "api.login", "api.health_check", "static", "api.verify_email", "api.resend_verification",
+          "api.forgot_password", "api.reset_password"}
 
 
 def test_every_private_endpoint_requires_auth(app, client):
