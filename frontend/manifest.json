@@ -1,0 +1,2 @@
+{"name":"HealthGuard Lite","short_name":"HealthGuard","start_url":"/","display":"standalone","background_color":"#effaf8","theme_color":"#0e9f9a",
+"icons":[{"src":"assets/icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}]}

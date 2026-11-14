@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: healthguard-api
+    runtime: python
+    rootDir: backend
+    plan: free
+    buildCommand: pip install -r requirements.txt && flask --app run db upgrade
+    startCommand: gunicorn run:app --bind 0.0.0.0:$PORT --workers 2 --timeout 60 --access-logfile - --error-logfile -
+    healthCheckPath: /api/health-check
+    envVars:
+      - {key: PYTHON_VERSION, value: 3.12.6}
+      - {key: TRUST_PROXY, value: "1"}
+      - {key: JWT_EXPIRY_HOURS, value: "24"}
+      - {key: SECRET_KEY, generateValue: true}   # 32+ chars; Render generates a random value
+      - {key: DATABASE_URL, sync: false}         # Neon connection string (set in dashboard)
+      - {key: CORS_ORIGINS, sync: false}         # e.g. https://your-app.vercel.app (comma-separated, no trailing slash)
