@@ -66,3 +66,6 @@ nav a{transition:background-color .25s var(--ease),color .25s var(--ease),transf
 .qmeter{height:6px;background:#e3f6f4;border-radius:9px;overflow:hidden;margin:8px 0}
 .qmeter i{display:block;height:100%;width:0;border-radius:9px;background:linear-gradient(90deg,#e8a23a,var(--turq));transition:width .5s var(--ease)}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+[hidden] {
+  display: none !important;
+}
