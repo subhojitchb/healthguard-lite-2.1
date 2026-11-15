@@ -38,8 +38,11 @@ async function api(path, method = "GET", body) {
 function toast(m) { const t = $("#toast"); t.textContent = m; t.classList.add("show"); clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove("show"), 3200); }
 const fmt = d => d ? new Date(d).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) : "—";
 const dayStr = localDay;   // local calendar date (never UTC)
-function modal(html) { $("#sheet").innerHTML = html; $("#modal").hidden = false; }
-function closeModal() { $("#modal").hidden = true; $("#sheet").innerHTML = ""; }
+function modal(html) { clearTimeout(S.modalTimer); const m = $("#modal"); m.classList.remove("closing"); $("#sheet").innerHTML = html; m.hidden = false; }
+function closeModal() {
+  const m = $("#modal"); if (m.hidden) return; m.classList.add("closing");   // 160 ms fade/slide-out, see style.css
+  clearTimeout(S.modalTimer); S.modalTimer = setTimeout(() => { m.hidden = true; m.classList.remove("closing"); $("#sheet").innerHTML = ""; }, 160);
+}
 $("#modal").addEventListener("click", e => { if (e.target.id === "modal" && !S.lock) closeModal(); });
 function countUp(el, to) { const t0 = performance.now(); (function f(t) { const p = Math.min((t - t0) / 700, 1); el.textContent = Math.round(to * p); if (p < 1) requestAnimationFrame(f); })(t0); }
 
@@ -167,17 +170,34 @@ async function viewHome(app) {
 function updateSteps() { const el = $("#steps"); if (!el) return; const n = S.baseSteps + (S.stepSession ? S.stepSession.count : 0); el.textContent = n; $("#bar").style.width = Math.min(100, n / 80) + "%"; }
 
 // ---------- heart rate (camera PPG) ----------
+// Rear camera, trying exact → ideal → any camera so a missing/unsupported facingMode degrades instead of failing.
+async function openRearCamera() {
+  const base = { width: { ideal: 320 }, height: { ideal: 240 }, frameRate: { ideal: 30 } };
+  let last;
+  for (const video of [{ ...base, facingMode: { exact: "environment" } }, { ...base, facingMode: { ideal: "environment" } }, true]) {
+    try { return await navigator.mediaDevices.getUserMedia({ video, audio: false }); }
+    catch (e) { last = e; if (["NotAllowedError", "SecurityError", "NotReadableError"].includes(e.name)) throw e; }   // retrying can't fix permission / busy camera
+  }
+  throw last;
+}
+function showHRFailure(message, noTorch) {
+  modal(`<h2>Couldn’t get a reliable reading</h2><p>${esc(message)}</p>
+  <p class="mut">Tips: sit down and rest your hand on a table · cover the lens <b>and</b> the flash · gentle, steady pressure · stay still and breathe normally.${noTorch ? " The flashlight isn’t available here, so measure in a bright place." : ""}</p>
+  <p class="mut small">Nothing was saved. Approximate wellness measurement — not a medical device.</p>
+  <button id="hr-retry" style="width:100%">Try again</button><br><br><button class="sec" id="hr-close" style="width:100%">Close</button>`);
+  $("#hr-close").onclick = closeModal; $("#hr-retry").onclick = () => { closeModal(); setTimeout(measureHR, 180); };
+}
 async function measureHR() {
   if (S.measuring) return;   // never run two measurements / open two camera streams
   if (!navigator.mediaDevices?.getUserMedia) return toast("Camera access is not supported in this browser (HTTPS required).");
   S.measuring = true; S.lock = true;
-  const R = { stream: null, track: null, torch: false, raf: 0, wd: 0, video: null, released: false };
-  const ts = [], red = [], cover = [], set = (id, txt) => { const e = $(id); if (e) e.textContent = txt; };
+  const R = { stream: null, track: null, torch: false, noTorch: false, raf: 0, vfc: 0, wd: 0, video: null, released: false };
+  const mon = new PPG.Monitor(), set = (id, txt) => { const e = $(id); if (e) e.textContent = txt; };
   const onHide = () => { if (document.hidden) abort("Measurement cancelled: the app went to the background."); };
   // release(): idempotent and never throws. Torch off first, then every track stopped, then the video detached.
   const release = async () => {
     if (R.released) return; R.released = true;
-    cancelAnimationFrame(R.raf); clearInterval(R.wd);
+    cancelAnimationFrame(R.raf); clearInterval(R.wd); try { R.video?.cancelVideoFrameCallback?.(R.vfc); } catch {}
     document.removeEventListener("visibilitychange", onHide); window.removeEventListener("pagehide", release);
     try { if (R.track && R.torch) await Promise.race([R.track.applyConstraints({ advanced: [{ torch: false }] }), new Promise(r => setTimeout(r, 400))]); } catch {}
     try { R.stream?.getTracks().forEach(t => { t.onended = null; t.stop(); }); } catch {}
@@ -188,63 +208,78 @@ async function measureHR() {
   S.abortHR = () => abort();
   document.addEventListener("visibilitychange", onHide); window.addEventListener("pagehide", release);
   modal(`<h2>Measuring…</h2><p class="mut">Gently cover the rear camera <b>and flash</b> with your fingertip. Stay still.</p>
-  <div class="ring"><span id="cd">30</span></div><canvas id="wave" width="460" height="90" style="width:100%"></canvas>
-  <p class="mut">Camera: <b id="cs">starting</b> · Flashlight: <b id="fs">off</b> · <span id="qs"></span></p><button class="sec" id="cx" style="width:100%">Cancel</button>`);
+  <p class="hint" id="hint">Starting the camera…</p>
+  <div class="ring" id="ring" data-state="waiting"><span id="cd">–</span></div><canvas id="wave" width="460" height="90" style="width:100%"></canvas>
+  <div class="qmeter" title="Signal quality"><i id="qfill"></i></div>
+  <p class="mut">Camera: <b id="cs">starting</b> · Flashlight: <b id="fs">off</b> · <span id="qs"></span></p>
+  <p class="mut small" id="note"></p><button class="sec" id="cx" style="width:100%">Cancel</button>
+  <p class="mut small">Approximate wellness measurement — not a medical device.</p>`);
   $("#cx").onclick = () => abort();
+  const finish = async res => {   // reliable result only: camera + torch are off before any network call
+    await release(); closeModal();
+    try { await api("/health/records", "POST", { heart_rate: res.bpm, signal_quality: res.quality, measurement_type: "camera_ppg" }); toast(`Saved: ${res.bpm} BPM (approximate)`); render(); }
+    catch (e) { toast("Measured " + res.bpm + " BPM but could not save: " + e.message); }
+  };
+  const fail = async st => { await release(); closeModal(); showHRFailure(st.hint, R.noTorch); };   // nothing is saved or reported
+  const ui = st => {
+    set("#hint", st.hint); set("#cd", st.remaining == null ? "–" : st.remaining > 0 ? st.remaining : "…");
+    const ring = $("#ring"); if (ring) ring.dataset.state = st.phase === "measuring" && st.code === "good" ? "good" : st.phase === "measuring" ? "weak" : st.phase;
+    const q = $("#qfill"); if (q) q.style.width = Math.round(st.quality * 100) + "%";
+    set("#qs", st.phase === "waiting" ? "No finger" : st.phase === "settling" ? "Settling…" : st.quality >= 0.6 ? "Signal good" : st.quality > 0.3 ? "Signal fair" : "Signal weak");
+    if (st.phase === "done") finish(st.result); else if (st.phase === "failed") fail(st);
+  };
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" }, width: 320, height: 240 }, audio: false });
+    const stream = await openRearCamera();
     if (R.released) { stream.getTracks().forEach(t => t.stop()); return; }   // cancelled while the permission prompt was open
     R.stream = stream; R.track = stream.getVideoTracks()[0];
     R.track.onended = () => abort("The camera was disconnected or taken by another app.");
-    set("#cs", "active");
-    try {
-      if (R.track.getCapabilities?.().torch) { await R.track.applyConstraints({ advanced: [{ torch: true }] }); R.torch = true; set("#fs", "on"); }
-      else set("#fs", "not supported");
-    } catch { set("#fs", "failed"); }
+    const facing = (R.track.getSettings?.() || {}).facingMode;
+    set("#cs", facing === "environment" ? "rear camera" : facing === "user" ? "front camera" : "active");
+    if (facing === "user") set("#note", "A front camera is in use (no rear camera found). The flashlight isn’t available and readings will be unreliable.");
+    // Torch: only claim "on" when the track confirms it. iOS Safari and many desktop browsers don't support it.
+    const caps = R.track.getCapabilities ? R.track.getCapabilities() : null;
+    if (caps && !caps.torch) { R.noTorch = true; set("#fs", "not supported"); }
+    else {
+      try { await R.track.applyConstraints({ advanced: [{ torch: true }] }); R.torch = true; const on = (R.track.getSettings?.() || {}).torch; if (on === false) { R.torch = false; R.noTorch = true; set("#fs", "failed"); } else set("#fs", on === true ? "on" : "on (unconfirmed)"); }
+      catch { R.noTorch = true; set("#fs", "failed"); }
+    }
+    if (R.noTorch && facing !== "user") set("#note", "No flashlight available here (common on iOS Safari). Measure in a bright place and cover the lens fully — readings may be less reliable.");
     if (R.released) return;
     const v = R.video = document.createElement("video"); v.srcObject = stream; v.muted = true; v.playsInline = true;
     try { await v.play(); } catch (e) { return abort("Could not start the camera preview: " + (e.message || e.name)); }
     if (R.released) return;
-    const cv = document.createElement("canvas"); cv.width = cv.height = 24; const cx = cv.getContext("2d", { willReadFrequently: true });
-    const wave = $("#wave")?.getContext("2d"), T0 = performance.now(), DUR = 30000; let lastFrame = T0;
+    const cv = document.createElement("canvas"); cv.width = cv.height = 32; const cx = cv.getContext("2d", { willReadFrequently: true });
+    const wave = $("#wave")?.getContext("2d"); let lastFrame = performance.now(), frames = 0, lastUi = -1e9, lastWave = -1e9, lastCT = -1;
     R.wd = setInterval(() => {   // watchdog: camera that never starts, or stalls mid-measurement
       const now = performance.now();
-      if (!ts.length && now - T0 > 5000) abort("No camera frames received. Try again or use another browser.");
-      else if (ts.length && now - lastFrame > 3000) abort("The camera stopped delivering frames.");
+      if (!frames && now - lastFrame > 5000) abort("No camera frames received. Try again or use another browser.");
+      else if (frames && now - lastFrame > 3000) abort("The camera stopped delivering frames.");
     }, 1000);
-    const loop = () => {
+    const onFrame = (now, meta) => {
       if (R.released) return;
       try {
-        const t = performance.now() - T0;
-        if (v.videoWidth) {
-          cx.drawImage(v, v.videoWidth / 2 - 24, v.videoHeight / 2 - 24, 48, 48, 0, 0, 24, 24);
-          const d = cx.getImageData(0, 0, 24, 24).data; let r = 0, g = 0;
-          for (let i = 0; i < d.length; i += 4) { r += d[i]; g += d[i + 1]; }
-          r /= 576; g /= 576; ts.push(t); red.push(r); cover.push(r > 120 && g < r * 0.5); lastFrame = performance.now();
-          if (wave) {
-            const sm = PPG.bandpass(ts, red).slice(-200); wave.clearRect(0, 0, 460, 90); wave.beginPath(); wave.strokeStyle = "#0e9f9a"; wave.lineWidth = 2;
-            const mx = Math.max(1e-6, ...sm.map(Math.abs)); sm.forEach((y, i) => { const X = i / 200 * 460, Y = 45 - y / mx * 38; i ? wave.lineTo(X, Y) : wave.moveTo(X, Y); }); wave.stroke();
+        // requestVideoFrameCallback delivers each NEW camera frame (no duplicate samples); the rAF fallback skips repeats via currentTime.
+        const fresh = meta !== undefined || v.currentTime !== lastCT; lastCT = v.currentTime;
+        if (v.videoWidth && fresh) {
+          cx.drawImage(v, v.videoWidth * 0.25, v.videoHeight * 0.25, v.videoWidth * 0.5, v.videoHeight * 0.5, 0, 0, 32, 32);   // centre half of the frame
+          const d = cx.getImageData(0, 0, 32, 32).data; let r = 0, g = 0, b = 0, sat = 0;
+          for (let i = 0; i < d.length; i += 4) { r += d[i]; g += d[i + 1]; b += d[i + 2]; if (d[i] >= 250) sat++; }
+          const n = d.length / 4, t = meta && meta.captureTime > 0 ? meta.captureTime : now;
+          mon.addFrame(t, r / n, g / n, b / n, sat / n); frames++; lastFrame = performance.now();
+          if (t - lastUi >= 250) { lastUi = t; ui(mon.status()); if (R.released) return; }
+          if (wave && t - lastWave >= 66) {
+            lastWave = t; const sm = mon.waveform().slice(-180); wave.clearRect(0, 0, 460, 90); wave.beginPath(); wave.strokeStyle = "#0e9f9a"; wave.lineWidth = 2;
+            const mx = Math.max(1e-6, ...sm.map(Math.abs)); sm.forEach((y, i) => { const X = i / 180 * 460, Y = 45 - y / mx * 38; i ? wave.lineTo(X, Y) : wave.moveTo(X, Y); }); wave.stroke();
           }
-          const c = cover.slice(-30).filter(Boolean).length / Math.min(30, cover.length); set("#qs", c > 0.8 ? "Finger detected ✓" : "Cover camera & flash");
         }
-        set("#cd", Math.max(0, Math.ceil((DUR - t) / 1000)));
-        if (t >= DUR) { finish(); return; }
       } catch (e) { abort("Measurement failed: " + (e.message || e)); return; }
-      R.raf = requestAnimationFrame(loop);
+      schedule();
     };
-    loop();
+    const schedule = () => { if (R.released) return; if (v.requestVideoFrameCallback) R.vfc = v.requestVideoFrameCallback(onFrame); else R.raf = requestAnimationFrame(t => onFrame(t)); };
+    schedule();
   } catch (e) {
-    const msg = { NotAllowedError: "Camera permission was denied.", NotFoundError: "No camera was found.", NotReadableError: "The camera is in use by another app.", OverconstrainedError: "No suitable rear camera.", SecurityError: "Camera access needs a secure (https) page." }[e.name];
+    const msg = { NotAllowedError: "Camera permission was denied. Allow camera access in your browser settings and try again.", NotFoundError: "No camera was found.", NotReadableError: "The camera is in use by another app.", OverconstrainedError: "No suitable camera.", SecurityError: "Camera access needs a secure (https) page." }[e.name];
     await abort("Camera unavailable: " + (msg || e.message || e.name));
-  }
-  async function finish() {
-    await release(); closeModal();   // camera + torch are off before any analysis or network call
-    try {
-      const res = PPG.analyzePPG(ts, red, cover);
-      if (!res.ok) return toast("No result: " + res.reason + " Please try again.");   // insufficient quality → nothing is reported or saved
-      try { await api("/health/records", "POST", { heart_rate: res.bpm, signal_quality: res.quality, measurement_type: "camera_ppg" }); toast(`Saved: ${res.bpm} BPM (approximate)`); render(); }
-      catch (e) { toast("Measured " + res.bpm + " BPM but could not save: " + e.message); }
-    } catch (e) { toast("Could not analyse the signal: " + (e.message || e)); }
   }
 }
 
